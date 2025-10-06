@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Shared Photo Booth</title>
+<style>
+body { font-family:sans-serif; margin:0; padding:20px; }
+.grid {
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(320px,1fr));
+  gap:12px;
+}
+video, canvas {
+  width:100%;
+  aspect-ratio:4/3;
+  object-fit:cover;
+  border:1px solid #bbb;
+  border-radius:4px;
+}
+button {
+  padding: 8px 16px;
+  margin-right: 10px;
+  margin-bottom: 10px;
+  background: #0074d9;
+  color: white;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+}
+button:disabled {
+  background: #ccc;
+  cursor: not-allowed;
+}
+#debugLog {
+  margin-top: 20px;
+  padding: 10px;
+  background: #f8f8f8;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  height: 200px;
+  overflow-y: auto;
+  font-family: monospace;
+  font-size: 12px;
+}
+#styleStatus {
+  margin-top: 10px;
+  padding: 8px;
+  background: #f8f8f8;
+  border-left: 4px solid #0074d9;
+}
+</style>
+</head>
+<body>
+<h1>Shared Photo Booth (Debug Version)</h1>
+<div>
+  <button id="hostBtn">I am the Host</button>
+  <button id="callerBtn">I am the Caller</button>
+  <button id="styleBtn" onclick="sendForStyling()" disabled>Apply Style</button>
+  <button id="saveBtn" onclick="saveCanvas()" disabled>Save Canvas</button>
+  <button id="testStyleBtn" onclick="testStyleServer()" disabled>Test Style Server</button>
+  <button id="clearLogBtn" onclick="clearLog()">Clear Log</button>
+</div>
+<div id="peerSection" style="display:none; margin:12px 0;">
+  <p id="peerIdDisplay"></p>
+  <input id="peerIdInput" placeholder="Enter Host's Peer ID">
+  <button id="connectBtn" disabled>Connect</button>
+</div>
+<div class="grid">
+  <div>
+    <p><strong>Host preview</strong></p>
+    <video id="localVideo" autoplay playsinline></video>
+  </div>
+  <div>
+    <p><strong>Caller – raw</strong></p>
+    <video id="remoteVideo" autoplay playsinline></video>
+  </div>
+  <div>
+    <p><strong>Caller – silhouette (MediaPipe)</strong></p>
+    <canvas id="callerCanvas" width="640" height="480"></canvas>
+  </div>
+  <div>
+    <p><strong>Both together</strong></p>
+    <canvas id="combinedCanvas" width="640" height="480"></canvas>
+  </div>
+  <div>
+    <p><strong>Styled Result</strong></p>
+    <canvas id="styledCanvas" width="640" height="480"></canvas>
+    <p id="styleStatus"></p>
+  </div>
+</div>
+
+<div id="debugLog"></div>
+
+<!-- libraries -->
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/selfie_segmentation.js"></script>
+<script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+<!-- NEW -->
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/depth-estimation@1.0.0/dist/depth-estimation.min.js"></script>
+
+<script>
+/* ---------- Debug Logging ---------- */
+const debugLog = document.getElementById('debugLog');
+const styleStatus = document.getElementById('styleStatus');
+const styleBtn = document.getElementById('styleBtn');
+const saveBtn = document.getElementById('saveBtn');
+const testStyleBtn = document.getElementById('testStyleBtn');
+
+function log(message) {
+  const timeStr = new Date().toLocaleTimeString();
+  const logEntry = document.createElement('div');
+  logEntry.textContent = `[${timeStr}] ${message}`;
+  debugLog.appendChild(logEntry);
+  debugLog.scrollTop = debugLog.scrollHeight;
+  console.log(message);
+}
+
+function clearLog() {
+  debugLog.innerHTML = '';
+}
+
+/* ---------- DOM helpers ---------- */
+const $ = id => document.getElementById(id);
+
+/* elements */
+const localVideo   = $('localVideo');
+const remoteVideo  = $('remoteVideo');
+const callerCanvas = $('callerCanvas');
+const combined     = $('combinedCanvas');
+const hostBtn      = $('hostBtn');
+const callerBtn    = $('callerBtn');
+const peerSection  = $('peerSection');
+const peerIdDisp   = $('peerIdDisplay');
+const peerIdInput  = $('peerIdInput');
+const connectBtn   = $('connectBtn');
+const styledCanvas = document.getElementById('styledCanvas');
+const styledCtx = styledCanvas.getContext('2d');
+
+let peer, localStream;
+
+/* ---------- camera ---------- */
+async function getCamera() {
+  log('Getting camera...');
+  if (localStream) return localStream;
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+    localVideo.srcObject = localStream;
+    log('Camera accessed successfully');
+  } catch (e) {
+    log(`Camera error: ${e.name}`);
+    console.error('getUserMedia', e.name);
+  }
+  connectBtn.disabled = false;
+  return localStream;
+}
+
+/* ---------- MediaPipe Selfie-Seg ---------- */
+log('Initializing MediaPipe...');
+const selfieSeg = new SelfieSegmentation({
+  locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/${f}`
+});
+selfieSeg.setOptions({ modelSelection: 1 });
+log('MediaPipe initialized');
+
+/* canvas contexts */
+const silCtx  = callerCanvas.getContext('2d');
+const combCtx = combined.getContext('2d');
+
+/* ---------- draw each result ---------- */
+selfieSeg.onResults(res => {
+  const W = callerCanvas.width, H = callerCanvas.height;
+
+  silCtx.clearRect(0, 0, W, H);
+  silCtx.drawImage(remoteVideo, 0, 0, W, H);
+  silCtx.globalCompositeOperation = 'destination-in';
+  silCtx.drawImage(res.segmentationMask, 0, 0, W, H);
+  silCtx.globalCompositeOperation = 'source-over';
+
+  combCtx.clearRect(0, 0, W, H);
+  combCtx.drawImage(localVideo, 0, 0, W, H);
+  combCtx.globalCompositeOperation = 'destination-out';
+  combCtx.drawImage(res.segmentationMask, 0, 0, W, H);
+  combCtx.globalCompositeOperation = 'source-over';
+  combCtx.drawImage(callerCanvas, 0, 0, W, H);
+  
+  // Enable buttons when we have a composite image
+  styleBtn.disabled = false;
+  saveBtn.disabled = false;
+  testStyleBtn.disabled = false;
+});
+
+/* ---------- drive MediaPipe ---------- */
+function startSegLoop() {
+  log('Starting segmentation loop');
+  (async function loop() {
+    if (remoteVideo.readyState >= 2) {
+      await selfieSeg.send({ image: remoteVideo });
+    }
+    requestAnimationFrame(loop);
+  })();
+}
+
+/* ---------- PeerJS plumbing ---------- */
+const newPeer = () => {
+  log('Creating new PeerJS connection');
+  return new Peer({ host: '0.peerjs.com', port: 443, path: '/', secure: true, debug: 2 });
+}
+
+function handleRemoteStream(stream) {
+  log('Remote stream received');
+  remoteVideo.srcObject = stream;
+  remoteVideo.onloadeddata = () => {
+    log('Remote video loaded, starting segmentation');
+    startSegLoop();
+  };
+}
+
+function wireCall(call, role) {
+  log(`Setting up ${role} call`);
+  call.on('stream', handleRemoteStream);
+  call.on('error', e => {
+    const msg = `[${role}] call error: ${e.message}`;
+    log(msg);
+    console.error(msg);
+  });
+}
+
+/* ---------- HOST ---------- */
+hostBtn.onclick = async () => {
+  log('Host button clicked');
+  await getCamera();
+  peer = newPeer();
+  peer.on('open', id => {
+    log(`Peer connection opened with ID: ${id}`);
+    peerIdDisp.textContent = `Share this ID: ${id}`;
+    peerSection.style.display = 'block';
+  });
+  peer.on('call', c => { 
+    log('Incoming call, answering');
+    c.answer(localStream || undefined); 
+    wireCall(c, 'HOST'); 
+  });
+};
+
+/* ---------- CALLER ---------- */
+callerBtn.onclick = async () => {
+  log('Caller button clicked');
+  await getCamera();
+  peer = newPeer();
+  peer.on('open', () => {
+    log('Peer connection opened');
+    peerSection.style.display = 'block';
+  });
+  connectBtn.onclick = () => {
+    const hostId = peerIdInput.value.trim();
+    if (!hostId) {
+      log('No host ID entered');
+      return alert('Enter host ID first');
+    }
+    log(`Calling host with ID: ${hostId}`);
+    wireCall(peer.call(hostId, localStream || undefined), 'CALLER');
+  };
+};
+
+/* ---------- Styling API Call ---------- */
+async function sendForStyling() {
+  log('Style button clicked');
+  styleStatus.textContent = 'Checking canvas data...';
+  
+  const dataURL = combined.toDataURL('image/png');
+
+  if (!dataURL || dataURL.length < 100) {
+    const msg = 'Combined canvas is empty or invalid';
+    log(msg);
+    styleStatus.textContent = `Error: ${msg}`;
+    return;
+  }
+  
+  log(`Canvas data length: ${dataURL.length} bytes`);
+  styleStatus.textContent = 'Sending image to server...';
+
+  try {
+    const serverUrl = 'https://127.0.0.1:5000/style';
+    log(`Connecting to: ${serverUrl}`);
+    
+    const res = await fetch(serverUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ image: dataURL }),
+      mode: 'cors'
+    });
+
+    log(`Server response status: ${res.status}`);
+
+    if (!res.ok) {
+      throw new Error(`Server error: ${res.status} ${res.statusText}`);
+    }
+
+    log('Parsing response JSON...');
+    const data = await res.json();
+    log('JSON parsed successfully');
+
+    if (!data.image || data.image.length < 100) {
+      throw new Error('Received invalid image data from server');
+    }
+
+    log(`Received image data length: ${data.image.length} bytes`);
+
+    const img = new Image();
+    img.onload = () => {
+      log(`Image loaded successfully: ${img.width}x${img.height}`);
+      styledCanvas.width = img.width;
+      styledCanvas.height = img.height;
+      styledCtx.drawImage(img, 0, 0);
+      styleStatus.textContent = 'Styling complete!';
+    };
+    img.onerror = (e) => {
+      const msg = 'Failed to load the styled image';
+      log(msg);
+      throw new Error(msg);
+    };
+    img.src = data.image;
+  } catch (err) {
+    const msg = `Error: ${err.message}`;
+    log(msg);
+    styleStatus.textContent = msg;
+    
+    if (err.message.includes('certificate') || err.message.includes('ssl') || 
+        err.message.includes('trust') || err.name === 'TypeError') {
+      styleStatus.innerHTML = `Error: HTTPS certificate issue.<br>
+        Please open <a href="https://127.0.0.1:5000/test" target="_blank">https://127.0.0.1:5000/test</a> directly 
+        in your browser and accept the certificate warning first.`;
+    }
+  }
+}
+
+/* ---------- Save Canvas ---------- */
+function saveCanvas() {
+  log('Save canvas button clicked');
+  const dataURL = combined.toDataURL('image/png');
+  
+  if (!dataURL || dataURL.length < 100) {
+    const msg = 'Canvas is empty or invalid!';
+    log(msg);
+    alert(msg);
+    return;
+  }
+  
+  log(`Canvas data saved: ${dataURL.length} bytes`);
+  const newTab = window.open();
+  newTab.document.write(`<img src="${dataURL}" alt="Canvas Image">
+    <p>Canvas dimensions: ${combined.width} x ${combined.height}</p>
+    <p>Data length: ${dataURL.length} bytes</p>`);
+}
+
+/* ---------- Test Style Server ---------- */
+async function testStyleServer() {
+  log('Testing style server with simple image');
+  styleStatus.textContent = 'Creating test image...';
+  
+  // Create a simple test image
+  const testCanvas = document.createElement('canvas');
+  testCanvas.width = 128;
+  testCanvas.height = 128;
+  const testCtx = testCanvas.getContext('2d');
+  
+  // Draw a simple pattern
+  testCtx.fillStyle = '#3498db';
+  testCtx.fillRect(0, 0, testCanvas.width, testCanvas.height);
+  
+  testCtx.fillStyle = '#e74c3c';
+  testCtx.beginPath();
+  testCtx.arc(64, 64, 40, 0, Math.PI * 2);
+  testCtx.fill();
+  
+  const dataURL = testCanvas.toDataURL('image/png');
+  log(`Test image created: ${dataURL.length} bytes`);
+  styleStatus.textContent = 'Sending test image to server...';
+  
+  try {
+    const serverUrl = 'https://127.0.0.1:5000/style';
+    log(`Connecting to ${serverUrl}`);
+    
+    const res = await fetch(serverUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ image: dataURL }),
+      mode: 'cors'
+    });
+    
+    log(`Server response status: ${res.status}`);
+    
+    if (!res.ok) {
+      throw new Error(`Server error: ${res.status} ${res.statusText}`);
+    }
+    
+    log('Parsing response JSON...');
+    const data = await res.json();
+    log('JSON parsed successfully');
+    
+    if (!data.image || data.image.length < 100) {
+      throw new Error('Received invalid image data from server');
+    }
+    
+    log(`Received image data length: ${data.image.length} bytes`);
+    
+    const img = new Image();
+    img.onload = () => {
+      log(`Test image styled successfully: ${img.width}x${img.height}`);
+      styledCanvas.width = img.width;
+      styledCanvas.height = img.height;
+      styledCtx.drawImage(img, 0, 0);
+      styleStatus.textContent = 'Test styling complete! Server works correctly.';
+    };
+    img.onerror = (e) => {
+      const msg = 'Failed to load the styled test image';
+      log(msg);
+      throw new Error(msg);
+    };
+    img.src = data.image;
+  } catch (err) {
+    const msg = `Test error: ${err.message}`;
+    log(msg);
+    styleStatus.textContent = msg;
+  }
+}
+
+// Log initialization
+log('Page loaded. Click "I am the Host" or "I am the Caller" to begin.');
+</script>
+</body>
+</html>

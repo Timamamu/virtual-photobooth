@@ -1,0 +1,14 @@
+body {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
+  }
+  
+  video, canvas {
+    border: 1px solid #ccc;
+    width: 640px;
+    height: 480px;
+    object-fit: cover;
+  }
+  

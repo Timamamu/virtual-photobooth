@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+
+# Models (too large for GitHub)
+models/
+*.pth
+*.pt
+
+# Certificates
+*.pem
+cert.pem
+key.pem
+
+# OS
+.DS_Store
+
+# Logs
+*.log.venv/
